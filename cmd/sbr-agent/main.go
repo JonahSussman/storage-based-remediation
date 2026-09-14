@@ -101,6 +101,10 @@ var (
 		"Timeout for considering nodes stale and removing them from slot mapping")
 	detectOnlyMode = flag.Bool(agent.FlagDetectOnlyMode, false,
 		"When true, disarm watchdog and do not remediate (detect and set node conditions only)")
+	sbrConfigNameFlag = flag.String(agent.FlagSBRConfigName, agent.DefaultSBRConfigName,
+		"Name of the StorageBasedRemediationConfig CR that owns this agent. "+
+			"Set by the controller via the DaemonSet pod spec. If empty, the agent falls back "+
+			"to discovering it by listing config objects in its namespace.")
 
 	// I/O timeout configuration
 	ioTimeout = flag.Duration("io-timeout", 2*time.Second,
@@ -521,6 +525,14 @@ type SBRAgent struct {
 	// Namespace for controller reconciliation (configurable for testing)
 	controllerNamespace string
 
+	// sbrConfigName is the name of the StorageBasedRemediationConfig CR that owns this agent
+	sbrConfigName string
+
+	// sbrConfigNamespace is the namespace of the StorageBasedRemediationConfig CR that owns this
+	// agent. Note this is distinct from controllerNamespace, which is only a controller-name
+	// suffix used to avoid name collisions between controllers sharing a manager in tests.
+	sbrConfigNamespace string
+
 	// detectOnlyMode when true disables remediation: watchdog is not armed, self-fence is never executed
 	detectOnlyMode bool
 
@@ -709,24 +721,46 @@ func NewSBRAgentWithWatchdog(
 	// Initialize metrics
 	sbrAgent.initMetrics()
 
+	podNamespace := os.Getenv("POD_NAMESPACE")
+	if *sbrConfigNameFlag != "" {
+		sbrAgent.sbrConfigName = *sbrConfigNameFlag
+		sbrAgent.sbrConfigNamespace = podNamespace
+		sbrConfig := &v1alpha1.StorageBasedRemediationConfig{}
+		if err := sbrAgent.k8sClient.Get(
+			sbrAgent.ctx,
+			client.ObjectKey{Name: *sbrConfigNameFlag, Namespace: podNamespace},
+			sbrConfig,
+		); err != nil {
+			logger.Error(err, "Failed to get StorageBasedRemediationConfig",
+				"name", *sbrConfigNameFlag, "namespace", podNamespace)
+			sbrAgent.recorderObject = nil
+		} else {
+			sbrAgent.recorderObject = sbrConfig
+		}
+	} else {
+		logger.Info("No sbr-config-name flag set, falling back to namespace discovery",
+			"namespace", podNamespace)
+		sbrConfigs := &v1alpha1.StorageBasedRemediationConfigList{}
+		if err := sbrAgent.k8sClient.List(
+			sbrAgent.ctx,
+			sbrConfigs,
+			client.InNamespace(podNamespace),
+		); err != nil {
+			logger.Error(err, "Failed to list StorageBasedRemediationConfig objects")
+		} else if len(sbrConfigs.Items) > 0 {
+			sbrAgent.recorderObject = &sbrConfigs.Items[0]
+			sbrAgent.sbrConfigName = sbrConfigs.Items[0].Name
+			sbrAgent.sbrConfigNamespace = sbrConfigs.Items[0].Namespace
+		} else {
+			logger.Info("No StorageBasedRemediationConfig found in namespace", "namespace", podNamespace)
+			sbrAgent.recorderObject = nil
+		}
+	}
+
 	if err := sbrAgent.initializeControllerManager(); err != nil {
 		return nil, fmt.Errorf("failed to initialize controller manager: %w", err)
 	}
 	sbrAgent.recorder = sbrAgent.controllerManager.GetEventRecorderFor("sbr-agent")
-	// Get the first StorageBasedRemediationConfig object from the POD_NAMESPACE
-	sbrConfigs := &v1alpha1.StorageBasedRemediationConfigList{}
-	if err := sbrAgent.k8sClient.List(
-		sbrAgent.ctx,
-		sbrConfigs,
-		client.InNamespace(os.Getenv("POD_NAMESPACE")),
-	); err != nil {
-		logger.Error(err, "Failed to list StorageBasedRemediationConfig objects")
-	} else if len(sbrConfigs.Items) > 0 {
-		sbrAgent.recorderObject = &sbrConfigs.Items[0]
-	} else {
-		logger.Info("No StorageBasedRemediationConfig found in namespace", "namespace", os.Getenv("POD_NAMESPACE"))
-		sbrAgent.recorderObject = nil
-	}
 	if sbrAgent.recorder != nil && sbrAgent.recorderObject != nil {
 		sbrAgent.recorder.Eventf(
 			sbrAgent.recorderObject,
@@ -920,7 +954,9 @@ func (s *SBRAgent) initializeBlockModeDevices(sb *blockformat.Superblock) error 
 // fallback uses synchronous blocking I/O with no timeout — if the storage
 // backend is unresponsive, the caller blocks, which is the correct behavior
 // for a fencing device (blocked heartbeat → watchdog fires).
-func openWithDirectOrReopen(path string, ioTimeout time.Duration, log logr.Logger) (mocks.BlockDeviceInterface, error) {
+type deviceOpenProbe func(mocks.BlockDeviceInterface) error
+
+func openWithDirectOrReopen(path string, ioTimeout time.Duration, log logr.Logger, probe deviceOpenProbe) (mocks.BlockDeviceInterface, error) {
 	dev, err := blockdevice.OpenWithTimeout(path, ioTimeout, log)
 	if err == nil {
 		// Some backends (e.g. Portworx sharedv4) accept O_DIRECT on open()
@@ -934,6 +970,16 @@ func openWithDirectOrReopen(path string, ioTimeout time.Duration, log logr.Logge
 			log.Info("Filesystem does not reliably honor O_DIRECT, falling back to reopen-per-read",
 				"path", path, "filesystem", fsName)
 			err = fmt.Errorf("%s filesystem does not reliably honor O_DIRECT", fsName)
+		} else if probe != nil {
+			// Probe the actual runtime I/O shape before accepting the direct device.
+			if probeErr := probe(dev); probeErr != nil {
+				log.Info("O_DIRECT runtime I/O probe failed, falling back to reopen-per-read",
+					"path", path, "error", probeErr.Error())
+				err = fmt.Errorf("O_DIRECT runtime I/O probe failed: %w", probeErr)
+			} else {
+				log.Info("Opened device with O_DIRECT and runtime I/O probe succeeded", "path", path)
+				return dev, nil
+			}
 		} else {
 			log.Info("Opened device with O_DIRECT", "path", path)
 			return dev, nil
@@ -953,6 +999,14 @@ func openWithDirectOrReopen(path string, ioTimeout time.Duration, log logr.Logge
 		return nil, fmt.Errorf("failed to open device %s (O_DIRECT: %v, reopen: %w)", path, err, reopenErr)
 	}
 
+	if probe != nil {
+		if probeErr := probe(reopenDev); probeErr != nil {
+			_ = reopenDev.Close()
+			return nil, fmt.Errorf("failed to verify reopen-per-read device %s after O_DIRECT fallback (%v): %w", path, err, probeErr)
+		}
+		log.Info("Reopen-per-read runtime I/O probe succeeded", "path", path)
+	}
+
 	return reopenDev, nil
 }
 
@@ -961,14 +1015,20 @@ func openWithDirectOrReopen(path string, ioTimeout time.Duration, log logr.Logge
 // reopen-per-read strategy that leverages NFS close-to-open consistency
 // when O_DIRECT is not supported by the storage backend.
 func (s *SBRAgent) initializeFilesystemModeDevices() error {
+	heartbeatProbe := func(device mocks.BlockDeviceInterface) error {
+		return performSBRReadWriteTest(device, s.nodeID, s.nodeName)
+	}
 	heartbeatDevice, err := openWithDirectOrReopen(s.heartbeatDevicePath, s.ioTimeout,
-		logger.WithName("heartbeat-device"))
+		logger.WithName("heartbeat-device"), heartbeatProbe)
 	if err != nil {
 		return fmt.Errorf("failed to open heartbeat device %s: %w",
 			s.heartbeatDevicePath, err)
 	}
 
-	fenceDevice, err := openWithDirectOrReopen(s.fenceDevicePath, s.ioTimeout, logger.WithName("fence-device"))
+	fenceProbe := func(device mocks.BlockDeviceInterface) error {
+		return performSBRFenceReadWriteTest(device, s.nodeID)
+	}
+	fenceDevice, err := openWithDirectOrReopen(s.fenceDevicePath, s.ioTimeout, logger.WithName("fence-device"), fenceProbe)
 	if err != nil {
 		return fmt.Errorf("failed to open fence device %s: %w", s.fenceDevicePath, err)
 	}
@@ -2401,287 +2461,6 @@ func probeBlockModeAt(devicePath string, ioTimeout time.Duration) (bool, *blockf
 	return true, sb, nil
 }
 
-// preflightBlockProbeTimeout bounds the superblock read used to detect block mode at pre-flight;
-// it matches the io-timeout flag default so a hung device fails fast.
-const preflightBlockProbeTimeout = 2 * time.Second
-
-// runPreflightChecks performs critical startup validation before entering main event loops
-// Returns success if EITHER watchdog is active OR SBR device is accessible (or both)
-// When detectOnlyMode is true, the watchdog check is skipped since the agent won't use it
-func runPreflightChecks(watchdogPath, sbrDevicePath, nodeName string, nodeID uint16, detectOnlyMode bool) error {
-	logger.Info("Running pre-flight checks",
-		"watchdogPath", watchdogPath,
-		"sbrDevicePath", sbrDevicePath,
-		"nodeName", nodeName,
-		"nodeID", nodeID,
-		"detectOnlyMode", detectOnlyMode)
-
-	// Check watchdog device availability (skip in detect-only mode)
-	var watchdogErr error
-	if detectOnlyMode {
-		// Treat as successful - watchdog is not needed in detect-only mode
-		logger.Info("Skipping watchdog pre-flight check (detect-only mode enabled)")
-	} else if watchdogPath != "" {
-		watchdogErr = checkWatchdogDevice(watchdogPath)
-	}
-
-	// Check SBR device accessibility. Detect block mode the same way the runtime does (a valid
-	// on-disk superblock) so a raw block device is verified via its superblock instead of the
-	// filesystem slot-write test, which would corrupt the block layout.
-	var sbrErr error
-	if sbrDevicePath != "" {
-		isBlock, _, probeErr := probeBlockModeAt(sbrDevicePath, preflightBlockProbeTimeout)
-		switch {
-		case probeErr != nil:
-			sbrErr = probeErr
-		case isBlock:
-			logger.Info("Pre-flight check passed: block-mode SBR device has a valid superblock",
-				"sbrDevicePath", sbrDevicePath)
-		default:
-			sbrErr = checkSBRDevice(sbrDevicePath, nodeID, nodeName, false)
-		}
-	}
-
-	// Check node ID/name resolution
-	nodeErr := checkNodeIDNameResolution(nodeName, nodeID)
-	if nodeErr != nil {
-		logger.Error(nodeErr, "Node ID/name resolution pre-flight check failed")
-		return fmt.Errorf("node ID/name resolution pre-flight check failed: %w", nodeErr)
-	}
-	logger.Info("Pre-flight check passed: node ID/name resolution successful",
-		"nodeName", nodeName,
-		"nodeID", nodeID)
-
-	// SBR device is always required
-	if sbrDevicePath == "" {
-		return fmt.Errorf("SBR device path cannot be empty")
-	}
-
-	// Check if at least one critical component (watchdog OR SBR) is working
-	if watchdogErr == nil && sbrErr == nil {
-		logger.Info("All pre-flight checks passed successfully")
-		return nil
-	} else if watchdogErr == nil {
-		return fmt.Errorf("pre-flight checks failed: SBR device is not available: %w", sbrErr)
-	} else if sbrErr == nil {
-		return fmt.Errorf("pre-flight checks failed: watchdog device is not available: %w", watchdogErr)
-	} else {
-		return fmt.Errorf(
-			"pre-flight checks failed: both watchdog device and SBR device are inaccessible. Watchdog error: %v, SBR error: %v",
-			watchdogErr, sbrErr)
-	}
-}
-
-// checkWatchdogDevice verifies the watchdog device exists and can be opened
-// Note: This function does NOT use softdog fallback - it strictly checks the specified device
-func checkWatchdogDevice(watchdogPath string) error {
-	logger.V(1).Info("Checking watchdog device availability", "watchdogPath", watchdogPath)
-
-	// For preflight checks, we want to be strict about the specified device
-	// Don't use softdog fallback here - if the specified device doesn't work, it should fail
-	wd, err := watchdog.NewWithSoftdogFallback(watchdogPath, logger.WithName("preflight-watchdog"))
-	if err != nil {
-		return fmt.Errorf("watchdog device pre-flight check failed: %w", err)
-	}
-	defer func() {
-		if closeErr := wd.Close(); closeErr != nil {
-			logger.Error(closeErr, "Failed to close watchdog device during pre-flight check",
-				"watchdogPath", wd.Path())
-		}
-	}()
-
-	logger.Info("Pre-flight check: using hardware watchdog device",
-		"watchdogPath", wd.Path())
-
-	logger.V(1).Info("Watchdog device successfully opened and closed", "watchdogPath", wd.Path())
-	return nil
-}
-
-// checkSBRDevice verifies the SBR device exists and performs a minimal read/write test.
-// When blockModeExpected is true, the device must contain a valid V1 superblock;
-// the function will never fall back to the filesystem slot-write test.
-// When blockModeExpected is false, the superblock region is not probed and the
-// filesystem slot-write test runs directly.
-func checkSBRDevice(sbrDevicePath string, nodeID uint16, nodeName string, blockModeExpected bool) error {
-	logger.V(1).Info("Checking SBR device accessibility",
-		"sbrDevicePath", sbrDevicePath, "nodeID", nodeID, "blockModeExpected", blockModeExpected)
-
-	// Check if the SBR device file exists
-	if _, err := os.Stat(sbrDevicePath); err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("SBR device does not exist: %s", sbrDevicePath)
-		}
-		return fmt.Errorf("failed to stat SBR device %s: %w", sbrDevicePath, err)
-	}
-
-	// Try to open the SBR device using the blockdevice package
-	device, err := blockdevice.Open(sbrDevicePath)
-	if err != nil {
-		return fmt.Errorf("failed to open SBR device %s: %w", sbrDevicePath, err)
-	}
-	defer func() {
-		if closeErr := device.Close(); closeErr != nil {
-			logger.Error(closeErr, "Failed to close SBR device during pre-flight check",
-				"sbrDevicePath", sbrDevicePath)
-		}
-	}()
-
-	if blockModeExpected {
-		return checkSBRBlockDevice(device, sbrDevicePath)
-	}
-
-	// Filesystem mode: perform minimal read/write test at the node's slot
-	if err := performSBRReadWriteTest(device, nodeID, nodeName); err != nil {
-		return fmt.Errorf("SBR device read/write test failed: %w", err)
-	}
-
-	logger.V(1).Info("SBR device read/write test completed successfully",
-		"sbrDevicePath", sbrDevicePath,
-		"nodeID", nodeID)
-	return nil
-}
-
-// checkSBRBlockDevice verifies a block-mode device has a valid V1 superblock.
-// It never falls back to the filesystem slot-write test.
-func checkSBRBlockDevice(device mocks.BlockDeviceInterface, sbrDevicePath string) error {
-	buf := blockdevice.DirectIOAlloc(int(blockformat.BlockSuperblockSize))
-	n, err := device.ReadAt(buf, blockformat.BlockSuperblockOffset)
-	if err != nil {
-		return fmt.Errorf("block mode device %s: failed to read superblock: %w", sbrDevicePath, err)
-	}
-	if n < blockformat.SuperblockTotalSize {
-		return fmt.Errorf("block mode device %s: short read (%d bytes), expected at least %d",
-			sbrDevicePath, n, blockformat.SuperblockTotalSize)
-	}
-
-	if blockformat.HasSuperblockMagic(buf) {
-		if _, unmarshalErr := blockformat.UnmarshalSuperblock(buf); unmarshalErr != nil {
-			return fmt.Errorf("block mode device %s has SBR magic but an invalid superblock: %w",
-				sbrDevicePath, unmarshalErr)
-		}
-		logger.V(1).Info("Block mode device: superblock read verified",
-			"sbrDevicePath", sbrDevicePath)
-		return nil
-	}
-
-	return fmt.Errorf("block mode device %s: no valid superblock found — device not initialized", sbrDevicePath)
-}
-
-// performSBRReadWriteTest writes the node ID to its slot and reads it back to verify functionality
-func performSBRReadWriteTest(device mocks.BlockDeviceInterface, nodeID uint16, nodeName string) error {
-	logger.V(1).Info("Performing SBR device read/write test", "nodeID", nodeID, "nodeName", nodeName)
-
-	// Calculate slot offset for this node
-	slotOffset := int64(nodeID) * sbdprotocol.SBD_SLOT_SIZE
-
-	// Create a test heartbeat message
-	sequence := uint64(1) // Use sequence 1 for pre-flight test
-	testHeader := sbdprotocol.NewHeartbeat(nodeID, sequence)
-	testMsg := sbdprotocol.SBDHeartbeatMessage{Header: testHeader}
-
-	// Marshal the test message
-	testMsgBytes, err := sbdprotocol.MarshalHeartbeat(testMsg)
-	if err != nil {
-		return fmt.Errorf("failed to marshal test heartbeat message: %w", err)
-	}
-
-	// Write test message to the node's slot
-	n, err := device.WriteAt(testMsgBytes, slotOffset)
-	if err != nil {
-		return fmt.Errorf("failed to write test message to SBR device at offset %d: %w", slotOffset, err)
-	}
-
-	if n != len(testMsgBytes) {
-		return fmt.Errorf("partial write to SBR device: wrote %d bytes, expected %d", n, len(testMsgBytes))
-	}
-
-	// Sync to ensure data is written to storage
-	if err := device.Sync(); err != nil {
-		return fmt.Errorf("failed to sync SBR device after test write: %w", err)
-	}
-
-	// Read back the data to verify write was successful
-	readBuffer := make([]byte, len(testMsgBytes))
-	readN, err := device.ReadAt(readBuffer, slotOffset)
-	if err != nil {
-		return fmt.Errorf("failed to read test message from SBR device at offset %d: %w", slotOffset, err)
-	}
-
-	if readN != len(testMsgBytes) {
-		return fmt.Errorf("partial read from SBR device: read %d bytes, expected %d", readN, len(testMsgBytes))
-	}
-
-	// Verify the data matches what we wrote
-	for i, b := range testMsgBytes {
-		if readBuffer[i] != b {
-			return fmt.Errorf("data mismatch at byte %d: wrote 0x%02x, read 0x%02x", i, b, readBuffer[i])
-		}
-	}
-
-	// Try to unmarshal the read data to ensure it's valid
-	readHeader, err := sbdprotocol.Unmarshal(readBuffer[:sbdprotocol.SBD_HEADER_SIZE])
-	if err != nil {
-		return fmt.Errorf("failed to unmarshal test message read from SBR device: %w", err)
-	}
-
-	// Verify the header matches our expectations
-	if readHeader.NodeID != nodeID {
-		return fmt.Errorf("node ID mismatch: expected %d, got %d", nodeID, readHeader.NodeID)
-	}
-
-	if readHeader.Sequence != sequence {
-		return fmt.Errorf("sequence mismatch: expected %d, got %d", sequence, readHeader.Sequence)
-	}
-
-	if readHeader.Type != sbdprotocol.SBD_MSG_TYPE_HEARTBEAT {
-		return fmt.Errorf("message type mismatch: expected %d, got %d", sbdprotocol.SBD_MSG_TYPE_HEARTBEAT, readHeader.Type)
-	}
-
-	logger.V(1).Info("SBR device read/write test successful",
-		"nodeID", nodeID,
-		"sequence", sequence,
-		"slotOffset", slotOffset,
-		"bytesWritten", n,
-		"bytesRead", readN)
-
-	return nil
-}
-
-// checkNodeIDNameResolution verifies that the node name and ID are valid and consistent
-func checkNodeIDNameResolution(nodeName string, nodeID uint16) error {
-	logger.V(1).Info("Checking node ID/name resolution", "nodeName", nodeName, "nodeID", nodeID)
-
-	// Validate node name is not empty
-	if nodeName == "" {
-		return fmt.Errorf("node name is empty")
-	}
-
-	// Validate node name length
-	if len(nodeName) > MaxNodeNameLength {
-		return fmt.Errorf("node name too long: %d characters, maximum allowed: %d", len(nodeName), MaxNodeNameLength)
-	}
-
-	// Validate node ID is within valid range
-	if nodeID < 1 || nodeID > sbdprotocol.SBD_MAX_NODES {
-		return fmt.Errorf("node ID %d is out of valid range [1, %d]", nodeID, sbdprotocol.SBD_MAX_NODES)
-	}
-
-	// Additional validation: ensure node name contains only valid characters
-	// (printable ASCII characters, no control characters)
-	for i, r := range nodeName {
-		if r < 32 || r > 126 {
-			return fmt.Errorf("node name contains invalid character at position %d: 0x%02x", i, r)
-		}
-	}
-
-	logger.V(1).Info("Node ID/name resolution successful",
-		"nodeName", nodeName,
-		"nodeNameLength", len(nodeName),
-		"nodeID", nodeID)
-
-	return nil
-}
-
 // initializeKubernetesClients creates Kubernetes clients for StorageBasedRemediation CR watching
 func initializeKubernetesClients(kubeconfigPath string) (client.Client, kubernetes.Interface, error) {
 	var config *rest.Config
@@ -2799,6 +2578,7 @@ func (s *SBRAgent) addSBRRemediationController() error {
 
 	reconciler.SetNodeManager(s.nodeManager)
 	reconciler.SetOwnNodeInfo(s.nodeID, s.nodeName)
+	reconciler.SetSBRConfigRef(s.sbrConfigName, s.sbrConfigNamespace)
 
 	// Set up the controller with the manager
 	if err := reconciler.SetupWithManager(s.controllerManager, s.controllerNamespace); err != nil {
@@ -2943,6 +2723,11 @@ func main() {
 		os.Exit(0)
 	}
 
+	if err := resetPreflightSentinelAt(agent.PreflightSentinelPath); err != nil {
+		logger.Error(err, "Failed to clear pre-flight sentinel")
+		os.Exit(1)
+	}
+
 	logger.Info("SBR Agent starting", "version", "development")
 
 	// Log build information at startup
@@ -3034,6 +2819,11 @@ func main() {
 	// Pass detectOnlyMode to skip watchdog check when not needed
 	if err := runPreflightChecks(*watchdogPath, *sbrDevice, nodeNameValue, nodeIDValue, *detectOnlyMode); err != nil {
 		logger.Error(err, "Pre-flight checks failed")
+		os.Exit(1)
+	}
+
+	if err := createPreflightSentinel(); err != nil {
+		logger.Error(err, "Failed to create pre-flight sentinel file; readiness probe will not pass")
 		os.Exit(1)
 	}
 
