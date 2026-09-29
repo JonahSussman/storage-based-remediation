@@ -110,11 +110,11 @@ bundle with operator-sdk:
 make dev-olm-deploy
 ```
 
-The temporary images expire after one hour by default. Override the duration
+The temporary images expire after two hours by default. Override the duration
 and deployment namespace when needed, for example:
 
 ```bash
-TTL_DURATION=4h OLM_OPERATOR_NAMESPACE=openshift-workload-availability make dev-olm-deploy
+TTL_SH_TTL=4h DEV_OLM_OPERATOR_NAMESPACE=openshift-workload-availability make dev-olm-deploy
 make dev-olm-undeploy
 ```
 
