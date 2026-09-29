@@ -26,6 +26,11 @@ export VERSION
 # Use the selected version for operator and agent image tags.
 IMAGE_TAG = v$(VERSION)
 export IMAGE_TAG
+
+.PHONY: print-image-tag
+print-image-tag: ## Print the current default image tag.
+	@printf '%s\n' '$(IMAGE_TAG)'
+
 # Image URL to use all building/pushing image targets
 IMG ?= $(QUAY_OPERATOR_NAME):$(IMAGE_TAG)
 
