@@ -23,12 +23,8 @@ PREVIOUS_VERSION ?= 0.3.1
 SKIP_RANGE_LOWER ?= 0.1.0
 export VERSION
 
-# When no version is set, use latest as image tags
-ifeq ($(VERSION), $(DEFAULT_VERSION))
-IMAGE_TAG = latest
-else
+# Use the selected version for operator and agent image tags.
 IMAGE_TAG = v$(VERSION)
-endif
 export IMAGE_TAG
 # Image URL to use all building/pushing image targets
 IMG ?= $(QUAY_OPERATOR_NAME):$(IMAGE_TAG)
@@ -807,10 +803,11 @@ add-replaces-field: ## Add replaces to CSV for versioned builds
 .PHONY: bundle-reset
 bundle-reset: ## Revert all version or build date related changes
 	VERSION=$(DEFAULT_VERSION) $(MAKE) bundle
+	VERSION=$(DEFAULT_VERSION) $(MAKE) add-replaces-field
+	sed -r -i "s|olm.skipRange: .*|olm.skipRange: '>=${SKIP_RANGE_LOWER} <$(DEFAULT_VERSION)'|;" ${CSV}
 	@# empty creation date
 	sed -r -i "s|createdAt: .*|createdAt: \"\"|;" ${CSV}
-	@# delete replaces field
-	sed -r -i "/replaces:.*/d" ${CSV}
+	VERSION=$(DEFAULT_VERSION) $(MAKE) bundle-validate
 
 .PHONY: operator-sdk
 operator-sdk: $(OPERATOR_SDK) ## Download operator-sdk locally if necessary.
