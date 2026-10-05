@@ -741,7 +741,8 @@ bundle-validate: operator-sdk ## Validate bundle directory
 	$(OPERATOR_SDK) bundle validate ./bundle --select-optional suite=operatorframework
 
 .PHONY: bundle-build
-bundle-build: bundle bundle-update ## Build bundle image
+bundle-build: bundle ## Build bundle image
+	$(MAKE) bundle-update
 	@echo "Building bundle image: ${BUNDLE_IMG}"
 	$(CONTAINER_TOOL) build --platform=$(BUILD_PLATFORM) -f bundle.Dockerfile -t ${BUNDLE_IMG} .
 
@@ -751,7 +752,7 @@ bundle-push: ## Push bundle image
 	$(CONTAINER_TOOL) push ${BUNDLE_IMG}
 
 # Add olm.channel entries for each channel in CHANNELS.
-# replaces and skipRange are emitted whenever their versions are set, so the generated catalog 
+# replaces and skipRange are emitted whenever their versions are set, so the generated catalog
 # always has a valid upgrade edge from an older installed version
 .PHONY: add_channel_entry_for_the_bundle
 add_channel_entry_for_the_bundle:
@@ -762,11 +763,15 @@ add_channel_entry_for_the_bundle:
 		echo "name: $$channel" >> ${CATALOG_INDEX}; \
 		echo "entries:" >> ${CATALOG_INDEX}; \
 		echo "  - name: ${OPERATOR_NAME}.v${VERSION}" >> ${CATALOG_INDEX}; \
-		if [ -n "${PREVIOUS_VERSION}" ] && [ "${PREVIOUS_VERSION}" != "${VERSION}" ]; then \
+		if [ -n "${PREVIOUS_VERSION}" ]; then \
+			if [ "${PREVIOUS_VERSION}" = "${VERSION}" ]; then \
+				echo "Error: PREVIOUS_VERSION must differ from VERSION"; \
+				exit 1; \
+			fi; \
 			echo "    replaces: ${OPERATOR_NAME}.v${PREVIOUS_VERSION}" >> ${CATALOG_INDEX}; \
 		fi; \
-		if [ -n "${SKIP_RANGE_LOWER}" ] && [ "${VERSION}" != "${SKIP_RANGE_LOWER}" ]; then \
-			if ! printf '%s\n' "${SKIP_RANGE_LOWER}" "${VERSION}" | sort -V -C 2>/dev/null; then \
+		if [ -n "${SKIP_RANGE_LOWER}" ]; then \
+			if [ "${SKIP_RANGE_LOWER}" = "${VERSION}" ] || ! printf '%s\n' "${SKIP_RANGE_LOWER}" "${VERSION}" | sort -V -C 2>/dev/null; then \
 				echo "Error: VERSION (${VERSION}) must be greater than SKIP_RANGE_LOWER (${SKIP_RANGE_LOWER})"; \
 				exit 1; \
 			fi; \
@@ -799,10 +804,13 @@ catalog-push: ## Push catalog image
 
 .PHONY: add-replaces-field
 add-replaces-field: ## Add replaces to CSV for versioned builds
-	@if [ "$(VERSION)" != "latest" ] && [ "$(PREVIOUS_VERSION)" != "$(VERSION)" ] && [ "$(PREVIOUS_VERSION)" != "" ]; then \
-		sed -r -i "/  version: $(VERSION)/ a\  replaces: $(OPERATOR_NAME).v$(PREVIOUS_VERSION)" ${CSV} || true ;\
-	else \
-		echo "Skipping replaces field (VERSION=$(VERSION), PREVIOUS_VERSION=$(PREVIOUS_VERSION))" ;\
+	@if [ -n "$(PREVIOUS_VERSION)" ] && [ "$(PREVIOUS_VERSION)" = "$(VERSION)" ]; then \
+		echo "Error: PREVIOUS_VERSION must differ from VERSION"; \
+		exit 1; \
+	fi
+	sed -r -i "/^  replaces:.*/d" ${CSV}
+	@if [ -n "$(PREVIOUS_VERSION)" ]; then \
+		sed -r -i "/^  version: $(VERSION)$$/ a\  replaces: $(OPERATOR_NAME).v$(PREVIOUS_VERSION)" ${CSV}; \
 	fi
 
 .PHONY: bundle-reset
@@ -850,15 +858,17 @@ bundle-update: yq ## Patch CSV with image, icon and skipRange
 	@# set icon
 	$(YQ) -i '.spec.icon[0].base64data = "$(ICON_BASE64)"' ${CSV}
 	@# set skipRange
-	@if [ -n "${SKIP_RANGE_LOWER}" ] && [ "${VERSION}" != "${DEFAULT_VERSION}" ] && [ "${VERSION}" != "${SKIP_RANGE_LOWER}" ]; then \
-		if ! printf '%s\n' "${SKIP_RANGE_LOWER}" "${VERSION}" | sort -V -C 2>/dev/null; then \
+	@if [ -n "${SKIP_RANGE_LOWER}" ]; then \
+		if [ "${SKIP_RANGE_LOWER}" = "${VERSION}" ] || ! printf '%s\n' "${SKIP_RANGE_LOWER}" "${VERSION}" | sort -V -C 2>/dev/null; then \
 			echo "Error: VERSION (${VERSION}) must be greater than SKIP_RANGE_LOWER (${SKIP_RANGE_LOWER})"; \
 			exit 1; \
 		fi; \
 		$(YQ) -i '.metadata.annotations."olm.skipRange" = ">=$(SKIP_RANGE_LOWER) <$(VERSION)"' ${CSV}; \
 	else \
-		$(YQ) -i '.metadata.annotations."olm.skipRange" = "<$(VERSION)"' ${CSV}; \
+		$(YQ) -i 'del(.metadata.annotations."olm.skipRange")' ${CSV}; \
 	fi
+	$(MAKE) add-replaces-field
+	$(MAKE) bundle-validate
 
 .PHONY: add-ocp-annotations
 add-ocp-annotations: yq ## Add OCP annotations
@@ -873,17 +883,20 @@ add-ocp-annotations: yq ## Add OCP annotations
 	$(YQ) -i '.metadata.annotations."features.operators.openshift.io/token-auth-gcp" = "false"' ${CSV}
 
 .PHONY: bundle-k8s
-bundle-k8s: bundle bundle-update ## Build community bundle for Kubernetes
+bundle-k8s: bundle ## Build community bundle for Kubernetes
+	$(MAKE) bundle-update
 	$(MAKE) add-community-edition-to-display-name
 
 .PHONY: bundle-okd
-bundle-okd: bundle bundle-update ## Build community bundle for OKD
+bundle-okd: bundle ## Build community bundle for OKD
+	$(MAKE) bundle-update
 	$(MAKE) add-community-edition-to-display-name
 	$(MAKE) add-replaces-field
 	echo -e "\n  # Annotations for OCP\n  com.redhat.openshift.versions: \"v$(OCP_VERSION)\"" >> bundle/metadata/annotations.yaml
 
 .PHONY: bundle-ocp
-bundle-ocp: bundle bundle-update ## Build bundle for OCP
+bundle-ocp: bundle ## Build bundle for OCP
+	$(MAKE) bundle-update
 	$(MAKE) add-replaces-field
 	$(MAKE) add-ocp-annotations
 	echo -e "\n  # Annotations for OCP\n  com.redhat.openshift.versions: \"v$(OCP_VERSION)\"" >> bundle/metadata/annotations.yaml
