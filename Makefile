@@ -827,7 +827,7 @@ bundle-reset: ## Revert all version or build date related changes
 
 .PHONY: operator-sdk
 operator-sdk: $(OPERATOR_SDK) ## Download operator-sdk locally if necessary.
-$(OPERATOR_SDK): $(LOCALBIN)
+$(OPERATOR_SDK): | $(LOCALBIN)
 	@{ \
 	set -e ;\
 	OS=$$(go env GOOS) && ARCH=$$(go env GOARCH) ;\
