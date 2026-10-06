@@ -5,6 +5,7 @@ FROM registry.access.redhat.com/ubi9/go-toolset:latest AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
+ARG VERSION
 
 # Set GOTOOLCHAIN to auto to allow Go to download newer versions
 ENV GOTOOLCHAIN=auto
@@ -14,7 +15,7 @@ WORKDIR /workspace
 
 # Copy go.mod and go.sum files for dependency caching
 # This allows Docker to cache the dependency download step
-COPY go.mod go.sum ./
+COPY go.mod go.sum Makefile ./
 COPY api/ api/
 COPY cmd/ cmd/
 COPY internal/ internal/

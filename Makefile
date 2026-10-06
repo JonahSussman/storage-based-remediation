@@ -12,8 +12,8 @@ QUAY_AGENT_IMG ?= $(IMAGE_REGISTRY)/$(AGENT_NAME)
 # VERSION defines the project version for the bundle.
 # Update this value when you upgrade the version of your project.
 # To re-generate a bundle for another specific version without changing the standard setup, you can:
-# - use the VERSION as arg of the bundle target (e.g make bundle VERSION=0.0.2)
-# - use environment variables to overwrite this value (e.g export VERSION=0.0.2)
+# - use the VERSION as arg of the bundle target (e.g make bundle VERSION=5.8.1)
+# - use environment variables to overwrite this value (e.g export VERSION=5.8.1)
 DEFAULT_VERSION := 5.8.0
 VERSION ?= $(DEFAULT_VERSION)
 # The version this build replaces in the upgrade graph. Defaults to the last GA release
@@ -407,7 +407,7 @@ clean-webhook-certs: ## Clean up generated webhook certificates.
 
 # Primary build targets (Quay-first approach)
 # Use these for standard development and CI/CD workflows
-# Example: make build-images VERSION=v1.0.0
+# Example: make build-images VERSION=5.8.1
 # Example: make build-push IMAGE_REGISTRY=my-registry.io/myorg
 
 # PLATFORMS defines the target platforms for multi-platform builds
@@ -420,27 +420,27 @@ BUILD_PLATFORM ?= linux/amd64
 build-operator-image: manifests generate fmt vet ## Build operator container image.
 	@echo "Building operator image: $(QUAY_OPERATOR_NAME):$(IMAGE_TAG)"
 	@echo "Git version info will be calculated automatically during build"
-	$(CONTAINER_TOOL) build --platform=$(BUILD_PLATFORM) -t ${IMG} .
+	$(CONTAINER_TOOL) build --platform=$(BUILD_PLATFORM) --build-arg VERSION=$(VERSION) -t ${IMG} .
 
 .PHONY: build-agent-image
 build-agent-image: manifests generate fmt vet ## Build agent container image.
 	@echo "Building agent image: $(QUAY_AGENT_IMG):$(IMAGE_TAG)"
 	@echo "Git version info will be calculated automatically during build"
-	$(CONTAINER_TOOL) build --platform=$(BUILD_PLATFORM) -f cmd/sbr-agent/Dockerfile -t ${AGENT_IMG} .
+	$(CONTAINER_TOOL) build --platform=$(BUILD_PLATFORM) --build-arg VERSION=$(VERSION) -f cmd/sbr-agent/Dockerfile -t ${AGENT_IMG} .
 
 .PHONY: build-multiarch-operator-image
 build-multiarch-operator-image: manifests generate fmt vet ## Build multi-platform operator container image.
 	@echo "Building multi-platform operator image: $(QUAY_OPERATOR_NAME):$(IMAGE_TAG)"
 	@echo "Platforms: $(PLATFORMS)"
 	@echo "Git version info will be calculated automatically during build"
-	$(CONTAINER_TOOL) build --platform=$(PLATFORMS) -t $(QUAY_OPERATOR_NAME):$(IMAGE_TAG) .
+	$(CONTAINER_TOOL) build --platform=$(PLATFORMS) --build-arg VERSION=$(VERSION) -t $(QUAY_OPERATOR_NAME):$(IMAGE_TAG) .
 
 .PHONY: build-multiarch-agent-image
 build-multiarch-agent-image: manifests generate fmt vet ## Build multi-platform agent container image.
 	@echo "Building multi-platform agent image: $(QUAY_AGENT_IMG):$(IMAGE_TAG)"
 	@echo "Platforms: $(PLATFORMS)"
 	@echo "Git version info will be calculated automatically during build"
-	$(CONTAINER_TOOL) build --platform=$(PLATFORMS) -f cmd/sbr-agent/Dockerfile -t $(QUAY_AGENT_IMG):$(IMAGE_TAG) .
+	$(CONTAINER_TOOL) build --platform=$(PLATFORMS) --build-arg VERSION=$(VERSION) -f cmd/sbr-agent/Dockerfile -t $(QUAY_AGENT_IMG):$(IMAGE_TAG) .
 
 .PHONY: build-images
 build-images: build-operator-image build-agent-image ## Build both operator and agent container images.

@@ -3,6 +3,7 @@
 FROM quay.io/konveyor/builder:ubi9-latest AS builder
 ARG TARGETOS
 ARG TARGETARCH
+ARG VERSION
 
 # Set GOTOOLCHAIN to auto to allow Go to download newer versions
 # Set to local to avoid downloading newer versions of Go
@@ -11,7 +12,7 @@ ENV GOTOOLCHAIN=auto
 WORKDIR /workspace
 
 # Copy the Go Modules manifests
-COPY go.mod go.sum ./
+COPY go.mod go.sum Makefile ./
 
 # Copy the go source and .git directory for version info
 COPY cmd/main.go cmd/main.go
