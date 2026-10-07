@@ -12,22 +12,25 @@ QUAY_AGENT_IMG ?= $(IMAGE_REGISTRY)/$(AGENT_NAME)
 # VERSION defines the project version for the bundle.
 # Update this value when you upgrade the version of your project.
 # To re-generate a bundle for another specific version without changing the standard setup, you can:
-# - use the VERSION as arg of the bundle target (e.g make bundle VERSION=0.0.2)
-# - use environment variables to overwrite this value (e.g export VERSION=0.0.2)
-DEFAULT_VERSION := 0.0.1
+# - use the VERSION as arg of the bundle target (e.g make bundle VERSION=5.8.1)
+# - use environment variables to overwrite this value (e.g export VERSION=5.8.1)
+DEFAULT_VERSION := 5.8.0
 VERSION ?= $(DEFAULT_VERSION)
-PREVIOUS_VERSION ?= $(DEFAULT_VERSION)
-# Lower bound for the skipRange field in the CSV, should be set to the oldest supported version
-SKIP_RANGE_LOWER ?=
+# The version this build replaces in the upgrade graph. Defaults to the last GA release
+# so the generated catalog always has a valid upgrade edge (override for point releases).
+PREVIOUS_VERSION ?= 0.3.1
+# Lower bound for the skipRange field, should be set to the oldest supported version.
+SKIP_RANGE_LOWER ?= 0.1.0
 export VERSION
 
-# When no version is set, use latest as image tags
-ifeq ($(VERSION), $(DEFAULT_VERSION))
-IMAGE_TAG = latest
-else
+# Use the selected version for operator and agent image tags.
 IMAGE_TAG = v$(VERSION)
-endif
 export IMAGE_TAG
+
+.PHONY: print-image-tag
+print-image-tag: ## Print the current default image tag.
+	@printf '%s\n' '$(IMAGE_TAG)'
+
 # Image URL to use all building/pushing image targets
 IMG ?= $(QUAY_OPERATOR_NAME):$(IMAGE_TAG)
 
@@ -57,10 +60,13 @@ GOBIN=$(shell go env GOBIN)
 endif
 
 # CONTAINER_TOOL defines the container tool to be used for building images.
-# Be aware that the target commands are only tested with Docker which is
-# scaffolded by default. However, you might want to replace it to use other
-# tools. (i.e. podman)
-CONTAINER_TOOL ?= podman
+CONTAINER_TOOL ?= $(shell \
+	if command -v podman >/dev/null 2>&1; then echo podman; \
+	elif command -v docker >/dev/null 2>&1; then echo docker; \
+	else echo podman; \
+	fi \
+)
+export CONTAINER_TOOL
 
 # Setting SHELL to bash allows bash commands to be executed by recipes.
 # Options are set to exit when a recipe line exits non-zero or a piped command fails.
@@ -404,7 +410,7 @@ clean-webhook-certs: ## Clean up generated webhook certificates.
 
 # Primary build targets (Quay-first approach)
 # Use these for standard development and CI/CD workflows
-# Example: make build-images VERSION=v1.0.0
+# Example: make build-images VERSION=5.8.1
 # Example: make build-push IMAGE_REGISTRY=my-registry.io/myorg
 
 # PLATFORMS defines the target platforms for multi-platform builds
@@ -417,27 +423,27 @@ BUILD_PLATFORM ?= linux/amd64
 build-operator-image: manifests generate fmt vet ## Build operator container image.
 	@echo "Building operator image: $(QUAY_OPERATOR_NAME):$(IMAGE_TAG)"
 	@echo "Git version info will be calculated automatically during build"
-	$(CONTAINER_TOOL) build --platform=$(BUILD_PLATFORM) -t ${IMG} .
+	$(CONTAINER_TOOL) build --platform=$(BUILD_PLATFORM) --build-arg OPERATOR_VERSION=$(VERSION) -t ${IMG} .
 
 .PHONY: build-agent-image
 build-agent-image: manifests generate fmt vet ## Build agent container image.
 	@echo "Building agent image: $(QUAY_AGENT_IMG):$(IMAGE_TAG)"
 	@echo "Git version info will be calculated automatically during build"
-	$(CONTAINER_TOOL) build --platform=$(BUILD_PLATFORM) -f cmd/sbr-agent/Dockerfile -t ${AGENT_IMG} .
+	$(CONTAINER_TOOL) build --platform=$(BUILD_PLATFORM) --build-arg OPERATOR_VERSION=$(VERSION) -f cmd/sbr-agent/Dockerfile -t ${AGENT_IMG} .
 
 .PHONY: build-multiarch-operator-image
 build-multiarch-operator-image: manifests generate fmt vet ## Build multi-platform operator container image.
 	@echo "Building multi-platform operator image: $(QUAY_OPERATOR_NAME):$(IMAGE_TAG)"
 	@echo "Platforms: $(PLATFORMS)"
 	@echo "Git version info will be calculated automatically during build"
-	$(CONTAINER_TOOL) build --platform=$(PLATFORMS) -t $(QUAY_OPERATOR_NAME):$(IMAGE_TAG) .
+	$(CONTAINER_TOOL) build --platform=$(PLATFORMS) --build-arg OPERATOR_VERSION=$(VERSION) -t $(QUAY_OPERATOR_NAME):$(IMAGE_TAG) .
 
 .PHONY: build-multiarch-agent-image
 build-multiarch-agent-image: manifests generate fmt vet ## Build multi-platform agent container image.
 	@echo "Building multi-platform agent image: $(QUAY_AGENT_IMG):$(IMAGE_TAG)"
 	@echo "Platforms: $(PLATFORMS)"
 	@echo "Git version info will be calculated automatically during build"
-	$(CONTAINER_TOOL) build --platform=$(PLATFORMS) -f cmd/sbr-agent/Dockerfile -t $(QUAY_AGENT_IMG):$(IMAGE_TAG) .
+	$(CONTAINER_TOOL) build --platform=$(PLATFORMS) --build-arg OPERATOR_VERSION=$(VERSION) -f cmd/sbr-agent/Dockerfile -t $(QUAY_AGENT_IMG):$(IMAGE_TAG) .
 
 .PHONY: build-images
 build-images: build-operator-image build-agent-image ## Build both operator and agent container images.
@@ -738,7 +744,8 @@ bundle-validate: operator-sdk ## Validate bundle directory
 	$(OPERATOR_SDK) bundle validate ./bundle --select-optional suite=operatorframework
 
 .PHONY: bundle-build
-bundle-build: bundle bundle-update ## Build bundle image
+bundle-build: bundle ## Build bundle image
+	$(MAKE) bundle-update
 	@echo "Building bundle image: ${BUNDLE_IMG}"
 	$(CONTAINER_TOOL) build --platform=$(BUILD_PLATFORM) -f bundle.Dockerfile -t ${BUNDLE_IMG} .
 
@@ -748,7 +755,8 @@ bundle-push: ## Push bundle image
 	$(CONTAINER_TOOL) push ${BUNDLE_IMG}
 
 # Add olm.channel entries for each channel in CHANNELS.
-# For development version (0.0.1), omit replaces and skipRange to avoid OLM catalog validation errors.
+# replaces and skipRange are emitted whenever their versions are set, so the generated catalog
+# always has a valid upgrade edge from an older installed version
 .PHONY: add_channel_entry_for_the_bundle
 add_channel_entry_for_the_bundle:
 	@for channel in $(shell echo ${CHANNELS} | tr ',' ' '); do \
@@ -758,11 +766,15 @@ add_channel_entry_for_the_bundle:
 		echo "name: $$channel" >> ${CATALOG_INDEX}; \
 		echo "entries:" >> ${CATALOG_INDEX}; \
 		echo "  - name: ${OPERATOR_NAME}.v${VERSION}" >> ${CATALOG_INDEX}; \
-		if [ -n "${PREVIOUS_VERSION}" ] && [ "${VERSION}" != "${DEFAULT_VERSION}" ] && [ "${PREVIOUS_VERSION}" != "${DEFAULT_VERSION}" ]; then \
+		if [ -n "${PREVIOUS_VERSION}" ]; then \
+			if [ "${PREVIOUS_VERSION}" = "${VERSION}" ]; then \
+				echo "Error: PREVIOUS_VERSION must differ from VERSION"; \
+				exit 1; \
+			fi; \
 			echo "    replaces: ${OPERATOR_NAME}.v${PREVIOUS_VERSION}" >> ${CATALOG_INDEX}; \
 		fi; \
-		if [ -n "${SKIP_RANGE_LOWER}" ] && [ "${VERSION}" != "${DEFAULT_VERSION}" ] && [ "${VERSION}" != "${SKIP_RANGE_LOWER}" ]; then \
-			if ! printf '%s\n' "${SKIP_RANGE_LOWER}" "${VERSION}" | sort -V -C 2>/dev/null; then \
+		if [ -n "${SKIP_RANGE_LOWER}" ]; then \
+			if [ "${SKIP_RANGE_LOWER}" = "${VERSION}" ] || ! printf '%s\n' "${SKIP_RANGE_LOWER}" "${VERSION}" | sort -V -C 2>/dev/null; then \
 				echo "Error: VERSION (${VERSION}) must be greater than SKIP_RANGE_LOWER (${SKIP_RANGE_LOWER})"; \
 				exit 1; \
 			fi; \
@@ -795,23 +807,27 @@ catalog-push: ## Push catalog image
 
 .PHONY: add-replaces-field
 add-replaces-field: ## Add replaces to CSV for versioned builds
-	@if [ "$(VERSION)" != "latest" ] && [ "$(PREVIOUS_VERSION)" != "$(VERSION)" ] && [ "$(PREVIOUS_VERSION)" != "" ]; then \
-		sed -r -i "/  version: $(VERSION)/ a\  replaces: $(OPERATOR_NAME).v$(PREVIOUS_VERSION)" ${CSV} || true ;\
-	else \
-		echo "Skipping replaces field (VERSION=$(VERSION), PREVIOUS_VERSION=$(PREVIOUS_VERSION))" ;\
+	@if [ -n "$(PREVIOUS_VERSION)" ] && [ "$(PREVIOUS_VERSION)" = "$(VERSION)" ]; then \
+		echo "Error: PREVIOUS_VERSION must differ from VERSION"; \
+		exit 1; \
+	fi
+	sed -r -i "/^  replaces:.*/d" ${CSV}
+	@if [ -n "$(PREVIOUS_VERSION)" ]; then \
+		sed -r -i "/^  version: $(VERSION)$$/ a\  replaces: $(OPERATOR_NAME).v$(PREVIOUS_VERSION)" ${CSV}; \
 	fi
 
 .PHONY: bundle-reset
 bundle-reset: ## Revert all version or build date related changes
 	VERSION=$(DEFAULT_VERSION) $(MAKE) bundle
+	VERSION=$(DEFAULT_VERSION) $(MAKE) add-replaces-field
+	sed -r -i "s|olm.skipRange: .*|olm.skipRange: '>=${SKIP_RANGE_LOWER} <$(DEFAULT_VERSION)'|;" ${CSV}
 	@# empty creation date
 	sed -r -i "s|createdAt: .*|createdAt: \"\"|;" ${CSV}
-	@# delete replaces field
-	sed -r -i "/replaces:.*/d" ${CSV}
+	VERSION=$(DEFAULT_VERSION) $(MAKE) bundle-validate
 
 .PHONY: operator-sdk
 operator-sdk: $(OPERATOR_SDK) ## Download operator-sdk locally if necessary.
-$(OPERATOR_SDK): $(LOCALBIN)
+$(OPERATOR_SDK): | $(LOCALBIN)
 	@{ \
 	set -e ;\
 	OS=$$(go env GOOS) && ARCH=$$(go env GOARCH) ;\
@@ -845,15 +861,17 @@ bundle-update: yq ## Patch CSV with image, icon and skipRange
 	@# set icon
 	$(YQ) -i '.spec.icon[0].base64data = "$(ICON_BASE64)"' ${CSV}
 	@# set skipRange
-	@if [ -n "${SKIP_RANGE_LOWER}" ] && [ "${VERSION}" != "${DEFAULT_VERSION}" ] && [ "${VERSION}" != "${SKIP_RANGE_LOWER}" ]; then \
-		if ! printf '%s\n' "${SKIP_RANGE_LOWER}" "${VERSION}" | sort -V -C 2>/dev/null; then \
+	@if [ -n "${SKIP_RANGE_LOWER}" ]; then \
+		if [ "${SKIP_RANGE_LOWER}" = "${VERSION}" ] || ! printf '%s\n' "${SKIP_RANGE_LOWER}" "${VERSION}" | sort -V -C 2>/dev/null; then \
 			echo "Error: VERSION (${VERSION}) must be greater than SKIP_RANGE_LOWER (${SKIP_RANGE_LOWER})"; \
 			exit 1; \
 		fi; \
 		$(YQ) -i '.metadata.annotations."olm.skipRange" = ">=$(SKIP_RANGE_LOWER) <$(VERSION)"' ${CSV}; \
 	else \
-		$(YQ) -i '.metadata.annotations."olm.skipRange" = "<$(VERSION)"' ${CSV}; \
+		$(YQ) -i 'del(.metadata.annotations."olm.skipRange")' ${CSV}; \
 	fi
+	$(MAKE) add-replaces-field
+	$(MAKE) bundle-validate
 
 .PHONY: add-ocp-annotations
 add-ocp-annotations: yq ## Add OCP annotations
@@ -868,17 +886,20 @@ add-ocp-annotations: yq ## Add OCP annotations
 	$(YQ) -i '.metadata.annotations."features.operators.openshift.io/token-auth-gcp" = "false"' ${CSV}
 
 .PHONY: bundle-k8s
-bundle-k8s: bundle bundle-update ## Build community bundle for Kubernetes
+bundle-k8s: bundle ## Build community bundle for Kubernetes
+	$(MAKE) bundle-update
 	$(MAKE) add-community-edition-to-display-name
 
 .PHONY: bundle-okd
-bundle-okd: bundle bundle-update ## Build community bundle for OKD
+bundle-okd: bundle ## Build community bundle for OKD
+	$(MAKE) bundle-update
 	$(MAKE) add-community-edition-to-display-name
 	$(MAKE) add-replaces-field
 	echo -e "\n  # Annotations for OCP\n  com.redhat.openshift.versions: \"v$(OCP_VERSION)\"" >> bundle/metadata/annotations.yaml
 
 .PHONY: bundle-ocp
-bundle-ocp: bundle bundle-update ## Build bundle for OCP
+bundle-ocp: bundle ## Build bundle for OCP
+	$(MAKE) bundle-update
 	$(MAKE) add-replaces-field
 	$(MAKE) add-ocp-annotations
 	echo -e "\n  # Annotations for OCP\n  com.redhat.openshift.versions: \"v$(OCP_VERSION)\"" >> bundle/metadata/annotations.yaml

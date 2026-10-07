@@ -4,17 +4,19 @@
 #   e.g. ./hack/build.sh -o bin/manager ./cmd/main.go
 #   e.g. ./hack/build.sh -o bin/sbr-agent ./cmd/sbr-agent
 
-GIT_VERSION=$(git describe --always --tags || true)
-VERSION=${CI_VERSION:-${GIT_VERSION}}
+VERSION=${VERSION:-$(sed -n 's/^DEFAULT_VERSION := //p' Makefile)}
+: "${VERSION:?Makefile must define DEFAULT_VERSION}"
+GIT_VERSION=$(git describe --always --tags --dirty || true)
 GIT_COMMIT=$(git rev-list -1 HEAD || true)
 COMMIT=${CI_COMMIT:-${GIT_COMMIT}}
 BUILD_DATE=$(date --utc -Iseconds)
 
 mkdir -p bin
 
-LDFLAGS_VALUE="-X github.com/medik8s/storage-based-remediation/internal/version.GitCommit=${COMMIT} "
-LDFLAGS_VALUE+="-X github.com/medik8s/storage-based-remediation/internal/version.GitDescribe=${VERSION} "
-LDFLAGS_VALUE+="-X github.com/medik8s/storage-based-remediation/internal/version.BuildDate=${BUILD_DATE} "
+LDFLAGS_VALUE="-X github.com/medik8s/storage-based-remediation/v5/internal/version.GitCommit=${COMMIT} "
+LDFLAGS_VALUE+="-X github.com/medik8s/storage-based-remediation/v5/internal/version.Version=${VERSION} "
+LDFLAGS_VALUE+="-X github.com/medik8s/storage-based-remediation/v5/internal/version.GitDescribe=${GIT_VERSION} "
+LDFLAGS_VALUE+="-X github.com/medik8s/storage-based-remediation/v5/internal/version.BuildDate=${BUILD_DATE} "
 # allow override for debugging flags
 LDFLAGS_DEBUG="${LDFLAGS_DEBUG:-" -s -w"}"
 LDFLAGS_VALUE+="${LDFLAGS_DEBUG}"

@@ -71,9 +71,10 @@ jobs:
 
       - name: Deploy SBR via OLM bundle
         run: |
+          SBR_TAG=$(make -s print-image-tag)
           operator-sdk run bundle -n ${OPERATOR_NAMESPACE} --use-http \
             --timeout 5m \
-            ${IMAGE_REGISTRY}/storage-based-remediation-operator-bundle:latest
+            ${IMAGE_REGISTRY}/storage-based-remediation-operator-bundle:${SBR_TAG}
 
       - name: Wait for operator to be ready
         run: make dev-wait

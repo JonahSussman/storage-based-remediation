@@ -30,5 +30,8 @@ jobs:
           password: ${{ secrets.QUAY_PASSWORD }}
           registry: quay.io
 
-      - name: Build and push CSV version v0.0.1 with latest images
-        run: export IMAGE_REGISTRY=quay.io/medik8s && make container-build-and-push
+      - name: Build and push the committed operator version with latest images
+        # Keep the real CSV version; only the container tags use latest.
+        run: >-
+          make container-build-and-push IMAGE_REGISTRY=quay.io/medik8s
+          IMAGE_TAG=latest CONTAINER_TOOL=docker

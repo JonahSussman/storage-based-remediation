@@ -7,6 +7,8 @@ import (
 
 // Build information that will be set via ldflags during build
 var (
+	// Version is the operator release version, independent of image tags.
+	Version = "5.8.0"
 	// GitCommit is the git commit SHA
 	GitCommit = "unknown"
 	// GitDescribe is the output of git describe --tags --dirty
@@ -21,6 +23,7 @@ var (
 
 // Info holds all the version information
 type Info struct {
+	Version     string `json:"version"`
 	GitCommit   string `json:"gitCommit"`
 	GitDescribe string `json:"gitDescribe"`
 	BuildDate   string `json:"buildDate"`
@@ -31,6 +34,7 @@ type Info struct {
 // Get returns the version information
 func Get() Info {
 	return Info{
+		Version:     Version,
 		GitCommit:   GitCommit,
 		GitDescribe: GitDescribe,
 		BuildDate:   BuildDate,
@@ -41,8 +45,8 @@ func Get() Info {
 
 // String returns a formatted string with all version information
 func (i Info) String() string {
-	return fmt.Sprintf("GitDescribe=%s, GitCommit=%s, BuildDate=%s, GoVersion=%s, Platform=%s",
-		i.GitDescribe, i.GitCommit, i.BuildDate, i.GoVersion, i.Platform)
+	return fmt.Sprintf("Version=%s, GitDescribe=%s, GitCommit=%s, BuildDate=%s, GoVersion=%s, Platform=%s",
+		i.Version, i.GitDescribe, i.GitCommit, i.BuildDate, i.GoVersion, i.Platform)
 }
 
 // GetFormattedBuildInfo returns formatted build information for logging

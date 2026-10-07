@@ -60,8 +60,6 @@ export OPM_RENDER_FLAGS="${OPM_RENDER_FLAGS:---skip-tls-verify}"
 export OPERATOR_NAMESPACE="${OPERATOR_NAMESPACE:-sbr-operator-system}"
 [ -n "${TOOLS_DIR:-}" ] && export TOOLS_DIR
 
-SBR_BUNDLE="${IMAGE_REGISTRY}/storage-based-remediation-operator-bundle:latest"
-
 SKIP_SETUP=false
 SKIP_BUILD=false
 SKIP_TEST=false
@@ -187,6 +185,8 @@ if [ "${SKIP_BUILD}" = false ]; then
     make bundle bundle-build bundle-push
 
     step "Deploying SBR via OLM bundle"
+    SBR_TAG=$(make -s print-image-tag)
+    SBR_BUNDLE="${IMAGE_REGISTRY}/storage-based-remediation-operator-bundle:${SBR_TAG}"
     operator-sdk cleanup storage-based-remediation -n "${OPERATOR_NAMESPACE}" --timeout 2m 2>/dev/null || true
     operator-sdk run bundle -n "${OPERATOR_NAMESPACE}" --use-http \
         --timeout 5m \

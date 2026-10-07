@@ -5,6 +5,8 @@ FROM registry.access.redhat.com/ubi9/go-toolset:latest AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
+# Avoid the Go toolset image's VERSION environment variable.
+ARG OPERATOR_VERSION=""
 
 # Set GOTOOLCHAIN to auto to allow Go to download newer versions
 ENV GOTOOLCHAIN=auto
@@ -14,7 +16,7 @@ WORKDIR /workspace
 
 # Copy go.mod and go.sum files for dependency caching
 # This allows Docker to cache the dependency download step
-COPY go.mod go.sum ./
+COPY go.mod go.sum Makefile ./
 COPY api/ api/
 COPY cmd/ cmd/
 COPY internal/ internal/
@@ -31,7 +33,7 @@ RUN mkdir -p bin && chown -R default:root bin
 USER default
 
 RUN git config --global --add safe.directory /workspace
-RUN ./hack/build.sh -o bin/sbr-agent ./cmd/sbr-agent
+RUN VERSION="${OPERATOR_VERSION}" ./hack/build.sh -o bin/sbr-agent ./cmd/sbr-agent
 
 # ==============================================================================
 # Runtime Stage - Minimal container for running the SBR Agent
